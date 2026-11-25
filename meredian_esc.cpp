@@ -1,16 +1,13 @@
 // ============================================================================
-// MEREDIAN Role Play — ESC Pause Interceptor (meredian_esc.asi)
+// MEREDIAN Role Play — Input & UI Interceptor v2 (meredian_esc.asi)
 // Target: GTA:SA US 1.0 + SA-MP 0.3.7-R1 / 0.3.7-R3-1 + samp-cef v1.4.1
 //
-// Как работает:
-//  - Перехватывает нажатие ESC в WndProc окна игры (gta_sa.exe).
-//  - Пропускает ESC как обычно, если:
-//      1) Зажат Shift (Shift + ESC -> вход в системное меню GTA:SA)
-//      2) Системное меню GTA:SA уже открыто (0xBA67A4 != 0)
-//      3) Открыт чат SA-MP (CInput::m_bEnabled) или диалог (CDialog::m_bIsActive)
-//  - В обычной игре блокирует стандартное баганое меню паузы GTA и отправляет
-//    клавишу VK_F11 в очередь сообщений окна -> samp-cef открывает/закрывает
-//    наше CEF-меню паузы без конфликтов с движком.
+// Функции:
+//  1) Перехватывает ESC -> блокирует баганое меню паузы GTA и шлёт VK_F11
+//     в CEF (открывает/закрывает CEF-меню паузы). Shift+ESC открывает родное меню.
+//  2) Перехватывает T, F6 и '/' (когда не открыт чат/диалог SA-MP и не зажат
+//     Shift/Ctrl/Alt) -> блокирует старую строку ввода SA-MP и шлёт VK_F12
+//     (или VK_F10 для '/') в CEF-чат!
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -19,10 +16,9 @@
 
 namespace {
 
-constexpr uintptr_t ADDR_GTA_HWND            = 0x00C97C1C; // HWND главного окна GTA:SA 1.0 US
-constexpr uintptr_t ADDR_GTA_MENU_ACTIVE     = 0x00BA67A4; // FrontEndMenuManager + 0x5C (m_bMenuActive)
+constexpr uintptr_t ADDR_GTA_HWND            = 0x00C97C1C;
+constexpr uintptr_t ADDR_GTA_MENU_ACTIVE     = 0x00BA67A4;
 
-// SA-MP 0.3.7-R1 & 0.3.7-R3-1 offsets
 constexpr uint32_t SAMP_EP_R1                = 0x0031DF13;
 constexpr uint32_t SAMP_EP_R3_1              = 0x000CC4D0;
 
@@ -32,14 +28,17 @@ constexpr uintptr_t SAMP_R1_CDIALOG          = 0x0021A0B8;
 constexpr uintptr_t SAMP_R3_CINPUT           = 0x0026E8CC;
 constexpr uintptr_t SAMP_R3_CDIALOG          = 0x0026E898;
 
-constexpr uintptr_t OFFSET_CINPUT_ENABLED    = 0x14E0;     // BOOL m_bEnabled
-constexpr uintptr_t OFFSET_CDIALOG_ACTIVE    = 0x0028;     // BOOL m_bIsActive
+constexpr uintptr_t OFFSET_CINPUT_ENABLED    = 0x14E0;
+constexpr uintptr_t OFFSET_CDIALOG_ACTIVE    = 0x0028;
 
-constexpr WPARAM CEF_TRIGGER_VK              = VK_F11;     // Не используется GTA:SA и SA-MP
+constexpr WPARAM VK_CEF_PAUSE                = VK_F11; // ESC -> CEF Pause
+constexpr WPARAM VK_CEF_CHAT                 = VK_F12; // T / F6 -> CEF Chat
+constexpr WPARAM VK_CEF_CHAT_CMD             = VK_F10; // '/' -> CEF Chat с "/"
 
 WNDPROC g_OrigWndProc      = nullptr;
 HWND    g_GameHwnd         = nullptr;
 bool    g_EscSwallowed     = false;
+WPARAM  g_ChatSwallowedKey = 0;
 bool    g_Running          = true;
 
 uintptr_t g_SampBase       = 0;
@@ -49,9 +48,7 @@ uintptr_t g_OffDialog      = 0;
 bool IsMemoryReadable(uintptr_t addr, size_t size) {
     if (addr < 0x10000) return false;
     MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) {
-        return false;
-    }
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == 0) return false;
     if (mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
     const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -101,73 +98,86 @@ bool IsSampUiOpen() {
     uintptr_t pInput = 0;
     if (SafeRead(g_SampBase + g_OffInput, pInput) && pInput != 0) {
         int32_t enabled = 0;
-        if (SafeRead(pInput + OFFSET_CINPUT_ENABLED, enabled) && enabled != 0) {
-            return true;
-        }
+        if (SafeRead(pInput + OFFSET_CINPUT_ENABLED, enabled) && enabled != 0) return true;
     }
 
     uintptr_t pDialog = 0;
     if (SafeRead(g_SampBase + g_OffDialog, pDialog) && pDialog != 0) {
         int32_t active = 0;
-        if (SafeRead(pDialog + OFFSET_CDIALOG_ACTIVE, active) && active != 0) {
-            return true;
-        }
+        if (SafeRead(pDialog + OFFSET_CDIALOG_ACTIVE, active) && active != 0) return true;
     }
     return false;
 }
 
-void PostCefMenuKey(HWND hwnd, bool keyDown) {
-    const UINT scan = MapVirtualKeyA(static_cast<UINT>(CEF_TRIGGER_VK), MAPVK_VK_TO_VSC);
+void PostCefVirtualKey(HWND hwnd, WPARAM vk, bool keyDown) {
+    const UINT scan = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
     const LPARAM lp = keyDown
         ? static_cast<LPARAM>((scan << 16) | 1u)
         : static_cast<LPARAM>((scan << 16) | 0xC0000001u);
-    PostMessageA(hwnd, keyDown ? WM_KEYDOWN : WM_KEYUP, CEF_TRIGGER_VK, lp);
+    PostMessageA(hwnd, keyDown ? WM_KEYDOWN : WM_KEYUP, vk, lp);
 }
 
 LRESULT CALLBACK MeredianWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    const bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool ctrlHeld  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool altHeld   = (GetKeyState(VK_MENU) & 0x8000) != 0;
+
+    // 1. Перехват ESC -> CEF Pause
     if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
-        const bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (!shiftHeld && !IsNativeGtaMenuOpen() && !IsSampUiOpen()) {
             const bool isRepeat = (lParam & 0x40000000) != 0;
             g_EscSwallowed = true;
-            if (!isRepeat) {
-                PostCefMenuKey(hwnd, true);
-            }
-            return 0; // Полностью блокируем стандартный ESC для gta_sa.exe
+            if (!isRepeat) PostCefVirtualKey(hwnd, VK_CEF_PAUSE, true);
+            return 0;
         }
         g_EscSwallowed = false;
     } else if (msg == WM_KEYUP && wParam == VK_ESCAPE) {
         if (g_EscSwallowed) {
             g_EscSwallowed = false;
-            PostCefMenuKey(hwnd, false);
+            PostCefVirtualKey(hwnd, VK_CEF_PAUSE, false);
             return 0;
         }
-    } else if (msg == WM_CHAR && wParam == 0x1B) {
-        if (g_EscSwallowed) {
+    } else if (msg == WM_CHAR && wParam == 0x1B && g_EscSwallowed) {
+        return 0;
+    }
+
+    // 2. Перехват T / F6 / '/' -> CEF Chat (когда не в фокусе ввода и не открыты меню)
+    if (msg == WM_KEYDOWN && !shiftHeld && !ctrlHeld && !altHeld && !IsNativeGtaMenuOpen() && !IsSampUiOpen()) {
+        if (wParam == 'T' || wParam == VK_F6) {
+            const bool isRepeat = (lParam & 0x40000000) != 0;
+            g_ChatSwallowedKey = wParam;
+            if (!isRepeat) PostCefVirtualKey(hwnd, VK_CEF_CHAT, true);
+            return 0;
+        } else if (wParam == VK_OEM_2) {
+            const bool isRepeat = (lParam & 0x40000000) != 0;
+            g_ChatSwallowedKey = wParam;
+            if (!isRepeat) PostCefVirtualKey(hwnd, VK_CEF_CHAT_CMD, true);
             return 0;
         }
+    } else if (msg == WM_KEYUP && g_ChatSwallowedKey != 0 && wParam == g_ChatSwallowedKey) {
+        const WPARAM trigger = (wParam == VK_OEM_2) ? VK_CEF_CHAT_CMD : VK_CEF_CHAT;
+        g_ChatSwallowedKey = 0;
+        PostCefVirtualKey(hwnd, trigger, false);
+        return 0;
+    } else if (msg == WM_CHAR && g_ChatSwallowedKey != 0) {
+        return 0;
     }
 
     return CallWindowProcA(g_OrigWndProc, hwnd, msg, wParam, lParam);
 }
 
 DWORD WINAPI InitThread(LPVOID) {
-    // Ждём создания главного окна GTA:SA
     HWND hwnd = nullptr;
     while (g_Running) {
-        if (SafeRead(ADDR_GTA_HWND, hwnd) && hwnd != nullptr && IsWindow(hwnd)) {
-            break;
-        }
+        if (SafeRead(ADDR_GTA_HWND, hwnd) && hwnd != nullptr && IsWindow(hwnd)) break;
         Sleep(100);
     }
     if (!g_Running || !hwnd) return 0;
 
-    // Даём samp.dll и samp-cef (cef.asi) завершить инициализацию и поставить свои хуки
     Sleep(2500);
     if (!g_Running || !IsWindow(hwnd)) return 0;
 
     DetectSampVersion();
-
     g_GameHwnd = hwnd;
     g_OrigWndProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrA(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(MeredianWndProc))
