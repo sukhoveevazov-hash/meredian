@@ -1,0 +1,22 @@
+name: Build meredian_esc.asi
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-x86:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      - name: Compile meredian_esc.asi
+        shell: cmd
+        run: cl /nologo /O2 /LD /MT meredian_esc.cpp /link user32.lib /OUT:meredian_esc.asi
+      - name: Upload meredian_esc.asi
+        uses: actions/upload-artifact@v4
+        with:
+          name: meredian_esc_asi
+          path: meredian_esc.asi
